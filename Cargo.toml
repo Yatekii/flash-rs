@@ -1,0 +1,9 @@
+[package]
+name = "flash-rs"
+version = "0.1.0"
+authors = ["Noah Hüsser <yatekii@yatekii.ch>"]
+edition = "2018"
+
+[dependencies]
+itertools = "0.8"
+ihex = "1.1.2"
