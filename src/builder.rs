@@ -8,6 +8,7 @@
 // from binascii import crc32
 
 // Number of bytes in a page to read to quickly determine if the page has the same data
+use crate::flash::Flash;
 use crate::common::same;
 
 const PAGE_ESTIMATE_SIZE: u32 = 32;
@@ -166,7 +167,7 @@ impl<'a> FlashBuilder<'a> {
         // Convert the list of flash operations into flash pages
         let mut program_byte_count = 0;
         let mut flash_address = self.flash_operations[0].address;
-        let mut info = self.flash.get_page_info(flash_address).ok_or_else(|| Err(FlashBuilderError::InvalidFlashAddress(flash_address)))?;
+        let mut info = self.flash.get_page_info(flash_address).ok_or_else(|| FlashBuilderError::InvalidFlashAddress(flash_address))?;
         let mut page_address = flash_address - (flash_address % info.size);
         let mut current_page = FlashPage::new(page_address, info.size, vec![], info.erase_weight, info.program_weight);
         self.page_list.push(current_page);
@@ -176,7 +177,7 @@ impl<'a> FlashBuilder<'a> {
                 // Check if operation is in next page
                 flash_address = flash_operation.address + pos as u32;
                 if flash_address >= current_page.address + current_page.size {
-                    info = self.flash.get_page_info(flash_address).ok_or_else(|| Err(FlashBuilderError::InvalidFlashAddress(flash_address)))?;
+                    info = self.flash.get_page_info(flash_address).ok_or_else(|| FlashBuilderError::InvalidFlashAddress(flash_address))?;
                     page_address = flash_address - (flash_address % info.size);
                     current_page = FlashPage::new(page_address, info.size, vec![], info.erase_weight, info.program_weight);
                     self.page_list.push(current_page);
@@ -191,9 +192,9 @@ impl<'a> FlashBuilder<'a> {
                 // }
 
                 // Copy data to page and increment pos
-                let space_left_in_page = info.size - current_page.data.len();
+                let space_left_in_page = info.size - current_page.data.len() as u32;
                 let space_left_in_data = flash_operation.data.len() - pos;
-                let amount = usize::min(space_left_in_page, space_left_in_data);
+                let amount = usize::min(space_left_in_page as usize, space_left_in_data);
                 current_page.extend(&flash_operation.data[pos..pos + amount]);
                 program_byte_count += amount;
 

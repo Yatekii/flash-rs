@@ -37,7 +37,7 @@ impl MemoryRegion {
         self.start + self.length
     }
 
-    fn contains_address(&self, address: u32) -> bool {
+    pub fn contains_address(&self, address: u32) -> bool {
         (address >= self.start) && (address <= self.end())
     }
 }

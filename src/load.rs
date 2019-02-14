@@ -94,7 +94,7 @@ pub struct FileDownloader;
 
 impl FileDownloader {
     pub fn new() -> Self {
-        Self
+        Self {}
     }
 
     /// Downloads a file at `path` into flash.
