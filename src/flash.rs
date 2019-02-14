@@ -15,6 +15,11 @@
 //     )
 
 
+use crate::flash_algorithm::{
+    FlashAlgorithm,
+    FlashAlgorithmInstruction::*,
+    FlashAlgorithmLocation::*,
+};
 use crate::target::Target;
 use crate::memory_map::MemoryRegion;
 
@@ -38,9 +43,9 @@ impl PageInfo {
 }
 
 pub struct FlashInfo {
-    rom_start: u32,
-    erase_weight: f32,
-    crc_supported: bool,
+    pub(crate) rom_start: u32,
+    pub(crate) erase_weight: f32,
+    pub(crate) crc_supported: bool,
 }
 
 impl FlashInfo {
@@ -60,49 +65,61 @@ impl FlashInfo {
 /// memory region boundaries, use the FlashLoader or FileProgrammer structs.
 pub struct Flash {
     target: Target,
-    region: MemoryRegion,
+    pub(crate) region: MemoryRegion,
+    flash_algorithm: FlashAlgorithm,
+    pub is_erase_all_supported: bool,
+    pub is_double_buffering_supported: bool,
+    did_prepare_target: bool,
+    active_operation: FlashOperation,
+}
+
+pub enum FlashError {
+    Init(u32),
+    Uninit(u32),
+    EraseAll(u32),
+    ErasePage(u32, u32), // (err_code, address)
+    ProgramPage(u32, u32), // (err_code, address)
+    WrongOperationOngoing(FlashOperation),
+    EraseAllNotSupported,
+}
+
+pub enum FlashOperation {
+    // Erase all or page erase.
+    Erase = 1,
+    // Program page or phrase.
+    Program = 2,
+    // Currently unused, but defined as part of the flash algorithm specification.
+    Verify = 3,
+    // Nothing ongoing.
+    None,
 }
 
 impl Flash {
-    // """!
-    // @brief 
-    // """
-    // class Operation(Enum):
-    //     """! @brief Operations passed to init(). """
-    //     ## Erase all or page erase.
-    //     ERASE = 1
-    //     ## Program page or phrase.
-    //     PROGRAM = 2
-    //     ## Currently unused, but fnined as part of the flash algorithm specification.
-    //     VERIFY = 3
-
     const DEFAULT_PAGE_PROGRAM_WEIGHT: f32 = 0.130;
     const DEFAULT_PAGE_ERASE_WEIGHT: f32 = 0.048;
-    const DEAULT_CHIP_ERASE_WEIGHT: f32 = 0.174;
+    const DEFAULT_CHIP_ERASE_WEIGHT: f32 = 0.174;
 
-    pub fn new(target: Target, region: MemoryRegion, flash_algo: u8) -> Self {
+    pub fn new(target: Target, region: MemoryRegion, flash_algorithm: FlashAlgorithm) -> Self {
         // self.target = target
-        // self.flash_algo = flash_algo
+        // self.flash_algorithm = flash_algorithm
         // self.flash_algo_debug = False
-        // self._region = None
-        // self._did_prepare_target = False
-        // self._active_operation = None
-        // if flash_algo is not None:
+        // self.active_operation = None
+        // if flash_algorithm is not None:
         //     self.is_valid = True
-        //     self.use_analyzer = flash_algo['analyzer_supported']
-        //     self.end_flash_algo = flash_algo['load_address'] + len(flash_algo['instructions']) * 4
-        //     self.begin_stack = flash_algo['begin_stack']
-        //     self.begin_data = flash_algo['begin_data']
-        //     self.static_base = flash_algo['static_base']
-        //     self.min_program_length = flash_algo.get('min_program_length', 0)
+        //     self.use_analyzer = flash_algorithm['analyzer_supported']
+        //     self.end_flash_algo = flash_algorithm['load_address'] + len(flash_algorithm['instructions']) * 4
+        //     self.begin_stack = flash_algorithm['begin_stack']
+        //     self.begin_data = flash_algorithm['begin_data']
+        //     self.static_base = flash_algorithm['static_base']
+        //     self.min_program_length = flash_algorithm.get('min_program_length', 0)
 
         //     # Validate required APIs.
         //     assert self._is_api_valid('pc_erase_sector')
         //     assert self._is_api_valid('pc_program_page')
 
         //     # Check for double buffering support.
-        //     if 'page_buffers' in flash_algo:
-        //         self.page_buffers = flash_algo['page_buffers']
+        //     if 'page_buffers' in flash_algorithm:
+        //         self.page_buffers = flash_algorithm['page_buffers']
         //     else:
         //         self.page_buffers = [self.begin_data]
 
@@ -121,13 +138,18 @@ impl Flash {
         Self {
             target,
             region,
+            flash_algorithm,
+            is_erase_all_supported: true,
+            is_double_buffering_supported: false,
+            did_prepare_target: false,
+            active_operation: FlashOperation::None,
         }
     }
         
     // fn _is_api_valid(&self, api_name):
-    //     return (api_name in self.flash_algo) \
-    //             and (&self.flash_algo[api_name] >= self.flash_algo['load_address']) \
-    //             and (&self.flash_algo[api_name] < self.end_flash_algo)
+    //     return (api_name in self.flash_algorithm) \
+    //             and (&self.flash_algorithm[api_name] >= self.flash_algorithm['load_address']) \
+    //             and (&self.flash_algorithm[api_name] < self.end_flash_algo)
 
     /// Get info about the page that contains this address.
     ///
@@ -140,90 +162,256 @@ impl Flash {
         }
     }
 
-    pub fn get_flash_builder(&self) -> FlashBuilder {
-        return FlashBuilder::new(&self, self.get_flash_info().rom_start)
+    /// Get info about the flash.
+    ///
+    /// Override this method to return different values.
+    pub fn get_flash_info(&self) -> FlashInfo {
+        FlashInfo::new(self.region.start, Self::DEFAULT_CHIP_ERASE_WEIGHT, false) // self.use_analyzer (TODO:)
+    }
+
+    pub fn cleanup(&mut self) -> Result<(), FlashError> {
+        self.uninit()?;
+        self.did_prepare_target = false;
+        Ok(())
+    }
+
+    pub fn uninit(&self) -> Result<(), FlashError> {
+        match self.active_operation {
+            FlashOperation::None => (),
+            o => {
+                // update core register to execute the uninit subroutine
+                let result = self.call_function_and_wait(
+                    self.flash_algorithm.get_instruction(PCUninit),
+                    Some(o as u32),
+                    None,
+                    None,
+                    None,
+                    false
+                );
+                
+                // check the return code
+                if result != 0 { return Err(FlashError::Uninit(result)); }
+            }
+        }
+        self.active_operation = FlashOperation::None;
+        Ok(())
+    }
+
+    /// Prepare the flash algorithm for performing erase and program operations.
+    pub fn init(&self, operation: FlashOperation) -> Result<(), FlashError> {
+        let address = self.get_flash_info().rom_start;
+        let clock = 0; // TODO: Maybe make this generic?
+        
+        self.target.halt();
+        if !self.did_prepare_target {
+            self.target.set_target_state("PROGRAM");
+            // TODO: This was pass;
+            // self.prepare_target();
+
+            // Load flash algo code into target RAM.
+            self.target.write_memory_block32(
+                self.flash_algorithm.get_address(LoadAddress),
+                self.flash_algorithm.get_instruction_list()
+            );
+
+            self.did_prepare_target = true;
+        }
+
+        // update core register to execute the init subroutine
+        let result = self.call_function_and_wait(
+            self.flash_algorithm.get_instruction(PCInit),
+            Some(address),
+            Some(clock),
+            Some(operation as u32),
+            None,
+            true
+        );
+
+        // check the return code
+        if result != 0 { return Err(FlashError::Init(result)); }
+        
+        self.active_operation = operation;
+        Ok(())
+    }
+
+    /// Erase all the flash.
+    pub fn erase_all(&self) -> Result<(), FlashError> {
+        if let FlashOperation::Erase = self.active_operation {
+            if self.is_erase_all_supported {
+                // update core register to execute the erase_all subroutine
+                let result = self.call_function_and_wait(
+                    self.flash_algorithm.get_instruction(PCEraseAll),
+                    None,
+                    None,
+                    None,
+                    None,
+                    true
+                );
+
+                // check the return code
+                if result != 0 { return Err(FlashError::EraseAll(result)); }
+                Ok(())
+            } else {
+                Err(FlashError::EraseAllNotSupported)
+            }
+        } else {
+            Err(FlashError::WrongOperationOngoing(self.active_operation))
+        }
+    }
+
+    /// Erase one page.
+    pub fn erase_page(&self, address: u32) -> Result<(), FlashError> {
+        if let FlashOperation::Erase = self.active_operation {
+            // update core register to execute the erase_page subroutine
+            let result = self.call_function_and_wait(
+                self.flash_algorithm.get_instruction(PCEraseSector),
+                Some(address),
+                None,
+                None,
+                None,
+                true
+            );
+
+            // check the return code
+            if result != 0 { return Err(FlashError::ErasePage(result, address)); }
+            Ok(())
+        } else {
+            Err(FlashError::WrongOperationOngoing(self.active_operation))
+        }
+    }
+
+    /// Flash one or more pages.
+    pub fn program_page(&self, address: u32, data: &[u8]) -> Result<(), FlashError> {
+        if let FlashOperation::Program = self.active_operation {
+            // prevent security settings from locking the device
+            self.override_security_bits(address, data);
+
+            // first transfer in RAM
+            self.target.write_memory_block8(self.flash_algorithm.get_address(BeginData), data);
+
+            // update core register to execute the program_page subroutine
+            let result = self.call_function_and_wait(
+                self.flash_algorithm.get_instruction(PCProgramPage),
+                Some(address),
+                Some(data.len() as u32),
+                Some(self.flash_algorithm.get_address(BeginData)),
+                None,
+                true
+            );
+
+            // check the return code
+            if result != 0 { return Err(FlashError::ProgramPage(result, address)); }
+            Ok(())
+        } else {
+            Err(FlashError::WrongOperationOngoing(self.active_operation))
+        }
+    }
+
+    fn call_function(
+        &self,
+        pc: u32,
+        r0: Option<u32>,
+        r1: Option<u32>,
+        r2: Option<u32>,
+        r3: Option<u32>,
+        init: bool
+    ) {
+        let instruction_list = vec![];
+
+        // if self.flash_algo_debug {
+        //     // Save vector catch state for use in wait_for_completion()
+        //     self.saved_vector_catch = self.target.get_vector_catch();
+        //     self.target.set_vector_catch(Target.CATCH_ALL);
+        // }
+
+        instruction_list.push(("pc", pc));
+        if let Some(r0) = r0 {
+            instruction_list.push(("r0", r0));
+        }
+        if let Some(r1) = r1 {
+            instruction_list.push(("r1", r1));
+        }
+        if let Some(r2) = r0 {
+            instruction_list.push(("r2", r2));
+        }
+        if let Some(r3) = r3 {
+            instruction_list.push(("r3", r3));
+        }
+        if init {
+            instruction_list.push(("r9", self.flash_algorithm.get_address(StaticBase)));
+            instruction_list.push(("sp", self.flash_algorithm.get_address(BeginStack)));
+        }
+
+        instruction_list.push(("lr", self.flash_algorithm.get_address(LoadAddress) + 1));
+        self.target.write_core_registers_raw(instruction_list);
+
+        // resume target
+        self.target.resume();
+    }
+
+    // Wait until the breakpoint is hit.
+    fn wait_for_completion(&self) -> u32 {
+        while self.target.get_state() == Target.TARGET_RUNNING {};
+
+        // if self.flash_algo_debug {
+        //     regs = self.target.read_core_registers_raw(list(range(19)) + [20])
+        //     println!("ALGO DBG: Registers after flash algo: [%s]", " ".join(regs.map(format!("{:08x}", r))));
+
+        //     let expected_fp = self.flash_algorithm.get_address(StaticBase);
+        //     let expected_sp = self.flash_algorithm.get_address(BeginStack);
+        //     let expected_pc = self.flash_algorithm.get_address(LoadAddress);
+        //     let expected_flash_algo = self.flash_algorithm.get_instructions();
+        //     if self.use_analyzer:
+        //         expected_analyzer = analyzer
+        //     final_ipsr = self.target.read_core_register('ipsr')
+        //     final_fp = self.target.read_core_register('r9')
+        //     final_sp = self.target.read_core_register('sp')
+        //     final_pc = self.target.read_core_register('pc')
+        //     #TODO - uncomment if Read/write and zero init sections can be moved into a separate flash algo section
+        //     #final_flash_algo = self.target.read_memory_block32(&self.flash_algorithm['load_address'], len(&self.flash_algorithm['instructions']))
+        //     #if self.use_analyzer:
+        //     #    final_analyzer = self.target.read_memory_block32(&self.flash_algorithm['analyzer_address'], len(analyzer))
+
+        //     error = False
+        //     if final_ipsr != 0:
+        //         LOG.error("IPSR should be 0 but is 0x%x", final_ipsr)
+        //         error = True
+        //     if final_fp != expected_fp:
+        //         # Frame pointer should not change
+        //         LOG.error("Frame pointer should be 0x%x but is 0x%x" % (expected_fp, final_fp))
+        //         error = True
+        //     if final_sp != expected_sp:
+        //         # Stack pointer should return to original value after function call
+        //         LOG.error("Stack pointer should be 0x%x but is 0x%x" % (expected_sp, final_sp))
+        //         error = True
+        //     if final_pc != expected_pc:
+        //         # PC should be pointing to breakpoint address
+        //         LOG.error("PC should be 0x%x but is 0x%x" % (expected_pc, final_pc))
+        //         error = True
+        //     #TODO - uncomment if Read/write and zero init sections can be moved into a separate flash algo section
+        //     #if not _same(expected_flash_algo, final_flash_algo):
+        //     #    LOG.error("Flash algorithm overwritten!")
+        //     #    error = True
+        //     #if self.use_analyzer and not _same(expected_analyzer, final_analyzer):
+        //     #    LOG.error("Analyzer overwritten!")
+        //     #    error = True
+        //     assert error == False
+        //     self.target.set_vector_catch(&self._saved_vector_catch)
+        // }
+
+        self.target.read_core_register("r0")
+    }
+
+    fn call_function_and_wait(&self, pc: u32, r0: Option<u32>, r1: Option<u32>, r2: Option<u32>, r3: Option<u32>, init: bool) -> u32 {
+        self.call_function(pc, r0, r1, r2, r3, init);
+        self.wait_for_completion()
+    }
+
+    /// TODO: does this function have any use (maybe overridden by another class)
+    fn override_security_bits(&self, address: u32, data: &[u8]) {
+        // Returned data in the PyOCD version ...
     }
 }
-
-    // @property
-    // fn minimum_program_length(&self):
-    //     return self.min_program_length
-
-    // @property
-    // fn page_buffer_count(&self):
-    //     return len(&self.page_buffers)
-    
-    // @property
-    // fn is_erase_all_supported(&self):
-    //     return self._is_api_valid('pc_eraseAll')
-
-    // @property
-    // fn is_double_buffering_supported(&self):
-    //     return self.double_buffer_supported
-    
-    // @property
-    // fn region(&self):
-    //     return self._region
-    
-    // @region.setter
-    // fn region(&self, flashRegion):
-    //     assert flashRegion.is_flash
-    //     self._region = flashRegion
-
-    // fn init(&self, operation, address=None, clock=0, reset=True):
-    //     """!
-    //     @brief Prepare the flash algorithm for performing erase and program operations.
-    //     """
-    //     if address is None:
-    //         address = self.get_flash_info().rom_start
-        
-    //     assert isinstance(operation, self.Operation)
-        
-    //     self.target.halt()
-    //     if not self._did_prepare_target:
-    //         if reset:
-    //             self.target.set_target_state("PROGRAM")
-    //         self.prepare_target()
-
-    //         # Load flash algo code into target RAM.
-    //         self.target.write_memory_block32(&self.flash_algo['load_address'], self.flash_algo['instructions'])
-
-    //         self._did_prepare_target = True
-
-    //     # update core register to execute the init subroutine
-    //     if self._is_api_valid('pc_init'):
-    //         result = self._call_function_and_wait(&self.flash_algo['pc_init'],
-    //                                           r0=address, r1=clock, r2=operation.value, init=True)
-
-    //         # check the return code
-    //         if result != 0:
-    //             LOG.error('init error: %i', result)
-        
-    //     self._active_operation = operation
-
-    // fn cleanup(&self):
-    //     self.uninit()
-    //     self.restore_target()
-    //     self._did_prepare_target = False
-
-    // fn uninit(&self):
-    //     if self._active_operation is None:
-    //         return
-        
-    //     if self._is_api_valid('pc_unInit'):
-    //         # update core register to execute the uninit subroutine
-    //         result = self._call_function_and_wait(&self.flash_algo['pc_unInit'],
-    //                                                 r0=self._active_operation.value)
-            
-    //         # check the return code
-    //         if result != 0:
-    //             LOG.error('init error: %i', result)
-            
-    //     self._active_operation = None
-
-    // fn prepare_target(&self):
-    //     """! @brief Subclasses can override this method to perform special target configuration."""
-    //     pass
     
     // fn restore_target(&self):
     //     """! @brief Subclasses can override this method to undo any target configuration changes."""
@@ -235,7 +423,7 @@ impl Flash {
     //     data = []
 
     //     # Load analyzer code into target RAM.
-    //     self.target.write_memory_block32(&self.flash_algo['analyzer_address'], analyzer)
+    //     self.target.write_memory_block32(&self.flash_algorithm['analyzer_address'], analyzer)
 
     //     # Convert address, size pairs into commands
     //     # for the crc computation algorithm to preform
@@ -252,70 +440,24 @@ impl Flash {
     //     self.target.write_memory_block32(&self.begin_data, data)
 
     //     # update core register to execute the subroutine
-    //     result = self._call_function_and_wait(&self.flash_algo['analyzer_address'], self.begin_data, len(data))
+    //     result = self._call_function_and_wait(&self.flash_algorithm['analyzer_address'], self.begin_data, len(data))
 
     //     # Read back the CRCs for each section
     //     data = self.target.read_memory_block32(&self.begin_data, len(data))
     //     return data
-
-    // fn erase_all(&self):
-    //     """!
-    //     @brief Erase all the flash.
-    //     """
-    //     assert self._active_operation == self.Operation.ERASE
-    //     assert self.is_erase_all_supported
-
-    //     # update core register to execute the erase_all subroutine
-    //     result = self._call_function_and_wait(&self.flash_algo['pc_eraseAll'])
-
-    //     # check the return code
-    //     if result != 0:
-    //         LOG.error('erase_all error: %i', result)
-
-    // fn erase_page(&self, flashPtr):
-    //     """!
-    //     @brief Erase one page.
-    //     """
-    //     assert self._active_operation == self.Operation.ERASE
-
-    //     # update core register to execute the erase_page subroutine
-    //     result = self._call_function_and_wait(&self.flash_algo['pc_erase_sector'], flashPtr)
-
-    //     # check the return code
-    //     if result != 0:
-    //         LOG.error('erase_page(0x%x) error: %i', flashPtr, result)
-
-    // fn program_page(&self, flashPtr, bytes):
-    //     """!
-    //     @brief Flash one or more pages.
-    //     """
-    //     assert self._active_operation == self.Operation.PROGRAM
-
-    //     # prevent security settings from locking the device
-    //     bytes = self.override_security_bits(flashPtr, bytes)
-
-    //     # first transfer in RAM
-    //     self.target.write_memory_block8(&self.begin_data, bytes)
-
-    //     # update core register to execute the program_page subroutine
-    //     result = self._call_function_and_wait(&self.flash_algo['pc_program_page'], flashPtr, len(bytes), self.begin_data)
-
-    //     # check the return code
-    //     if result != 0:
-    //         LOG.error('program_page(0x%x) error: %i', flashPtr, result)
 
     // fn start_program_page_with_buffer(&self, bufferNumber, flashPtr):
     //     """!
     //     @brief Start flashing one or more pages.
     //     """
     //     assert bufferNumber < len(&self.page_buffers), "Invalid buffer number"
-    //     assert self._active_operation == self.Operation.PROGRAM
+    //     assert self.active_operation == self.Operation.PROGRAM
 
     //     # get info about this page
     //     page_info = self.get_page_info(flashPtr)
 
     //     # update core register to execute the program_page subroutine
-    //     result = self._call_function(&self.flash_algo['pc_program_page'], flashPtr, page_info.size, self.page_buffers[bufferNumber])
+    //     result = self._call_function(&self.flash_algorithm['pc_program_page'], flashPtr, page_info.size, self.page_buffers[bufferNumber])
 
     // fn load_page_buffer(&self, bufferNumber, flashPtr, bytes):
     //     """!
@@ -339,7 +481,7 @@ impl Flash {
     //     @exception FlashFailure The address or data length is not aligned to the minimum
     //         programming length specified in the flash algorithm.
     //     """
-    //     assert self._active_operation == self.Operation.PROGRAM
+    //     assert self.active_operation == self.Operation.PROGRAM
 
     //     # Get min programming length. If one was not specified, use the page size.
     //     if self.min_program_length:
@@ -360,25 +502,11 @@ impl Flash {
     //     self.target.write_memory_block8(&self.begin_data, bytes)
 
     //     # update core register to execute the program_page subroutine
-    //     result = self._call_function_and_wait(&self.flash_algo['pc_program_page'], flashPtr, len(bytes), self.begin_data)
+    //     result = self._call_function_and_wait(&self.flash_algorithm['pc_program_page'], flashPtr, len(bytes), self.begin_data)
 
     //     # check the return code
     //     if result != 0:
     //         LOG.error('program_phrase(0x%x) error: %i', flashPtr, result)
-
-    // fn get_flash_info(&self):
-    //     """!
-    //     @brief Get info about the flash.
-
-    //     Override this method to return different values.
-    //     """
-    //     assert self.region is not None
-
-    //     info = FlashInfo()
-    //     info.rom_start = self.region.start
-    //     info.erase_weight = fnAULT_CHIP_ERASE_WEIGHT
-    //     info.crc_supported = self.use_analyzer
-    //     return info
 
     // fn flash_block(&self, addr, data, smart_flash=True, chip_erase=None, progress_cb=None, fast_verify=False):
     //     """!
@@ -392,100 +520,6 @@ impl Flash {
     //     info = fb.program(chip_erase, progress_cb, smart_flash, fast_verify)
     //     return info
 
-    // fn _call_function(&self, pc, r0=None, r1=None, r2=None, r3=None, init=False):
-    //     reg_list = []
-    //     data_list = []
-
-    //     if self.flash_algo_debug:
-    //         # Save vector catch state for use in wait_for_completion()
-    //         self._saved_vector_catch = self.target.get_vector_catch()
-    //         self.target.set_vector_catch(Target.CATCH_ALL)
-
-    //     reg_list.append('pc')
-    //     data_list.append(pc)
-    //     if r0 is not None:
-    //         reg_list.append('r0')
-    //         data_list.append(r0)
-    //     if r1 is not None:
-    //         reg_list.append('r1')
-    //         data_list.append(r1)
-    //     if r2 is not None:
-    //         reg_list.append('r2')
-    //         data_list.append(r2)
-    //     if r3 is not None:
-    //         reg_list.append('r3')
-    //         data_list.append(r3)
-    //     if init:
-    //         reg_list.append('r9')
-    //         data_list.append(&self.static_base)
-    //     if init:
-    //         reg_list.append('sp')
-    //         data_list.append(&self.begin_stack)
-    //     reg_list.append('lr')
-    //     data_list.append(&self.flash_algo['load_address'] + 1)
-    //     self.target.write_core_registers_raw(reg_list, data_list)
-
-    //     # resume target
-    //     self.target.resume()
-
-    // fn wait_for_completion(&self):
-    //     """!
-    //     @brief Wait until the breakpoint is hit.
-    //     """
-    //     while(&self.target.get_state() == Target.TARGET_RUNNING):
-    //         pass
-
-    //     if self.flash_algo_debug:
-    //         regs = self.target.read_core_registers_raw(list(range(19)) + [20])
-    //         LOG.debug("Registers after flash algo: [%s]", " ".join("%08x" % r for r in regs))
-
-    //         expected_fp = self.flash_algo['static_base']
-    //         expected_sp = self.flash_algo['begin_stack']
-    //         expected_pc = self.flash_algo['load_address']
-    //         expected_flash_algo = self.flash_algo['instructions']
-    //         if self.use_analyzer:
-    //             expected_analyzer = analyzer
-    //         final_ipsr = self.target.read_core_register('ipsr')
-    //         final_fp = self.target.read_core_register('r9')
-    //         final_sp = self.target.read_core_register('sp')
-    //         final_pc = self.target.read_core_register('pc')
-    //         #TODO - uncomment if Read/write and zero init sections can be moved into a separate flash algo section
-    //         #final_flash_algo = self.target.read_memory_block32(&self.flash_algo['load_address'], len(&self.flash_algo['instructions']))
-    //         #if self.use_analyzer:
-    //         #    final_analyzer = self.target.read_memory_block32(&self.flash_algo['analyzer_address'], len(analyzer))
-
-    //         error = False
-    //         if final_ipsr != 0:
-    //             LOG.error("IPSR should be 0 but is 0x%x", final_ipsr)
-    //             error = True
-    //         if final_fp != expected_fp:
-    //             # Frame pointer should not change
-    //             LOG.error("Frame pointer should be 0x%x but is 0x%x" % (expected_fp, final_fp))
-    //             error = True
-    //         if final_sp != expected_sp:
-    //             # Stack pointer should return to original value after function call
-    //             LOG.error("Stack pointer should be 0x%x but is 0x%x" % (expected_sp, final_sp))
-    //             error = True
-    //         if final_pc != expected_pc:
-    //             # PC should be pointing to breakpoint address
-    //             LOG.error("PC should be 0x%x but is 0x%x" % (expected_pc, final_pc))
-    //             error = True
-    //         #TODO - uncomment if Read/write and zero init sections can be moved into a separate flash algo section
-    //         #if not _same(expected_flash_algo, final_flash_algo):
-    //         #    LOG.error("Flash algorithm overwritten!")
-    //         #    error = True
-    //         #if self.use_analyzer and not _same(expected_analyzer, final_analyzer):
-    //         #    LOG.error("Analyzer overwritten!")
-    //         #    error = True
-    //         assert error == False
-    //         self.target.set_vector_catch(&self._saved_vector_catch)
-
-    //     return self.target.read_core_register('r0')
-
-    // fn _call_function_and_wait(&self, pc, r0=None, r1=None, r2=None, r3=None, init=False):
-    //     self._call_function(pc, r0, r1, r2, r3, init)
-    //     return self.wait_for_completion()
-
     // fn set_flash_algo_debug(&self, enable):
     //     """!
     //     @brief Turn on extra flash algorithm checking
@@ -493,6 +527,3 @@ impl Flash {
     //     When set this may slow down flash algo performance.
     //     """
     //     self.flash_algo_debug = enable
-
-    // fn override_security_bits(&self, address, data):
-    //     return data

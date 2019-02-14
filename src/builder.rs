@@ -8,7 +8,10 @@
 // from binascii import crc32
 
 // Number of bytes in a page to read to quickly determine if the page has the same data
-use crate::flash::Flash;
+use crate::flash::{
+    self,
+    Flash,
+};
 use crate::common::same;
 
 const PAGE_ESTIMATE_SIZE: u32 = 32;
@@ -109,10 +112,11 @@ impl<'a> FlashBuilder<'a> {
     // FLASH_ANALYSIS_CRC32 = "CRC32"
     // FLASH_ANALYSIS_PARTIAL_PAGE_READ = "PAGE_READ"
 
-    fn new(flash: Flash, base_addr: u32) -> Self {
+    pub fn new(flash: Flash) -> Self {
+        let flash_start = flash.get_flash_info().rom_start;
         Self {
             flash,
-            flash_start: base_addr,
+            flash_start: flash_start,
             flash_operations: vec![],
             buffered_data_size: 0,
             page_list: vec![],
@@ -184,7 +188,7 @@ impl<'a> FlashBuilder<'a> {
                 }
 
                 // Fill the page gap if there is one
-                // TODO: WTF?
+                // TODO:
                 // let page_data_end = current_page.address + current_page.data.len() as u32;
                 // if flash_address != page_data_end {
                 //     let old_data = self.flash.target.read_memory_block8(page_data_end, flash_address - page_data_end);
@@ -286,10 +290,10 @@ impl<'a> FlashBuilder<'a> {
                 if !erased {
                     chip_erase_count += 1;
                     chip_erase_weight += page.get_program_weight();
-                    page.erased = self.flash.region.is_erased(page.data)
+                    page.erased = Some(self.flash.region.is_erased(page.data.as_slice()));
                 }
             } else {
-                page.erased = self.flash.region.is_erased(page.data)
+                page.erased = Some(self.flash.region.is_erased(page.data.as_slice()));
             }
         }
         (chip_erase_count, chip_erase_weight)
@@ -305,15 +309,15 @@ impl<'a> FlashBuilder<'a> {
 
     /// Program by first performing a chip erase.
     fn chip_erase_program(&mut self) {
-        self.flash.init(self.flash.Operation.ERASE);
+        self.flash.init(flash::FlashOperation::Erase);
         self.flash.erase_all();
         self.flash.uninit();
         
-        self.flash.init(self.flash.Operation.PROGRAM);
+        self.flash.init(flash::FlashOperation::Program);
         for page in self.page_list {
             if let Some(erased) = page.erased {
                 if !erased {
-                    self.flash.program_page(page.address, page.data);
+                    self.flash.program_page(page.address, page.data.as_slice());
                 }
             }
         }
@@ -327,12 +331,12 @@ impl<'a> FlashBuilder<'a> {
             if let Some(same) = page.same {
                 // Program page if not the same
                 if !same {
-                    self.flash.init(self.flash.Operation.ERASE);
+                    self.flash.init(flash::FlashOperation::Erase);
                     self.flash.erase_page(page.address);
                     self.flash.uninit();
 
-                    self.flash.init(self.flash.Operation.PROGRAM);
-                    self.flash.program_page(page.address, page.data);
+                    self.flash.init(flash::FlashOperation::Program);
+                    self.flash.program_page(page.address, page.data.as_slice());
                     self.flash.uninit();
                 }
             } else {

@@ -3,8 +3,10 @@ use crate::memory_map::{
     MemoryRegion,
     RegionType,
 };
+use crate::flash::Flash;
 use crate::builder::FlashBuilder;
 use crate::memory_map::MemoryMap;
+use crate::flash_algorithm::FlashAlgorithm;
 use std::path::Path;
 use std::io::{ Read, Seek, SeekFrom };
 use std::fs::File;
@@ -395,7 +397,7 @@ impl<'a> FlashLoader<'a> {
                     } else {
                         // if region.flash is None:
                         //     raise RuntimeError("flash memory region at address 0x%08x has no flash instance" % address)
-                        self.builders[&region] = region.flash.get_flash_builder();
+                        self.builders[&region] = FlashBuilder::new(Flash::new(target, region, FlashAlgorithm::new()));
                         self.builders[&region]
                     };
                 

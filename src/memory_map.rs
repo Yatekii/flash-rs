@@ -33,12 +33,24 @@ pub struct MemoryRegion {
 }
 
 impl MemoryRegion {
+    const erased_byte_value: u8 = 0x00;
+
     pub fn end(&self) -> u32 {
         self.start + self.length
     }
 
     pub fn contains_address(&self, address: u32) -> bool {
         (address >= self.start) && (address <= self.end())
+    }
+
+    /// Helper method to check if a block of data is erased.
+    pub fn is_erased(self, d: &[u8]) -> bool {
+        for b in d {
+            if *b != Self::erased_byte_value {
+                return false;
+            }
+        }
+        true
     }
 }
 
